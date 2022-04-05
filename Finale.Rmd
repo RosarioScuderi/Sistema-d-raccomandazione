@@ -1,0 +1,747 @@
+---
+title: "Sistema di raccomandazione"
+author: "Rosario Scuderi"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Librerie, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+library(dplyr)
+library(knitr)
+library(reticulate)
+library(ggplot2)
+library(data.table)
+library(recommenderlab)
+library(lsa)
+library(plotrix)
+```
+### **1 Introduzione**
+
+All'interno di questo notebook si analizzerano le caratteristiche di un insieme di datasets contenenti informazioni interenti serie TV e film Anime per poi creare un sistema di raccomandazione ottimale.
+
+In primis, si eseguirà un processo di data-cleaning per testare la qualità dei dati e, qualora fosse necessario, modificarli in modo da evitare errori e renderli migliori. In un secondo momento, sarà effettuata una breve analisi sui generi e sugli utenti. In fine si testeranno i principali sistemi di raccomandazione sul dataset dei rating e verrà implementato quello con i risultati migliori filtrando i risultati con strategie content-based. 
+
+In generale si effettueranno i seguenti passaggi:
+
+- Presentazione dei dati
+- Data Cleaning
+- Analisi dei dati
+- Confronto tra gli algoritmi di raccomandazione tradizionali
+- Implementazione pratica dell'algoritmo migliore sul dataset in esame
+
+**Librerie utilizzate**
+
+- [dplyr](https://www.rdocumentation.org/packages/dplyr/versions/0.7.8)
+- [knitr](https://cran.r-project.org/web/packages/knitr/index.html)
+- [reticulate](https://rstudio.github.io/reticulate/)
+- [ggplot2](https://ggplot2.tidyverse.org/)
+- [data.table](https://cran.r-project.org/web/packages/data.table/index.html)
+- [recommenderlab](https://www.rdocumentation.org/packages/recommenderlab/versions/0.2-7)
+- [lsa](https://cran.r-project.org/web/packages/lsa/index.html)
+- [plotrix](https://cran.r-project.org/web/packages/plotrix/index.html)
+
+### **2 Presentazione dei dati**
+
+I dati provengono dai vari databases del sito [My animelist](https://myanimelist.net/) e includono informazioni su utenti e items e sono stati estratti tramite processi di scraping dal sito stesso. [***INFO  EXTRA***](https://www.kaggle.com/hernan4444/anime-recommendation-database-2020)
+
+Nel generale si hanno a disposizione:
+
+- *Dataset contenente le valutazioni effettuate dagli utenti sui vari Anime*
+- *Dataset contenente le caratteristiche dei singoli items*
+
+Importiamo i datasets contenenti ***informazioni sugli anime***
+```{r Import dati, echo=FALSE}
+Anime=fread("anime.csv")
+Anime_syn=fread("anime_with_synopsis.csv")
+Anime=Anime[,-6]
+kable(head(Anime,5), align = "c")
+kable(head(Anime_syn,5), align = "c")
+```
+
+Per ogni anime conosciamo il numero di utenti che lo hanno completato (o lasciato incompleto), la casa di produzione, genere, tipo di contenuto (film o serie tv) e il riassunto.
+Sfortunatamente non è disponibile alcuna informazione riguardo gli utenti, come ad esempio l'età.
+
+Controlliamo se sui 2 file sono presenti lo stesso numero di items.
+```{r Studio dati 1, echo=TRUE}
+nrow(Anime)
+nrow(Anime_syn)
+```
+Come possiamo vedere il numero è **diverso**. Successivamente, sarà necessario creare un unico dataset per facilitare l'interpretazione dei risultati e migliorarne la gestione.
+
+
+Importiamo i datasets contenenti ***informazioni sui rating***
+
+```{r Import dati 2, echo=FALSE}
+Rating=fread("rating_complete.csv")
+kable(head(Rating,5), align = "c")
+
+```
+```{r Studio dati 2, echo=TRUE}
+nrow(Rating)
+length(unique(Rating$user_id))
+length(unique(Rating$anime_id))
+```
+Il dataset contiente **57633278** valutazioni effettuate da **310059** utenti su **16872**.
+Anche in questo caso il numero di anime è differente. Inoltre, sarà necessario effettuare una serie di valutazioni sul numero di utenti per verificare la presenza di tuple uguali. (Un utente non può valutare 2 volte lo stesso item)
+
+
+### **3 Data Cleaning**
+
+Durante la presentazione dei dati sono emersi alcuni dettagli poco coerenti, come il numero diverso di items presenti nei vari datasets; dunque, in primis, è necessario creare un unico dataset contenente le informazioni più rilevanti e corrette per ogni item.
+
+Tra tutte le informazioni presenti, solo alcune sono utili alla nostra analisi. In particolare oltre l'id, il genere, il titolo inglese (più comprensibile e diffuso rispetto a quello originale), potrebbero rivelarsi interessanti anche i dettagli relativi allo studio di sviluppo o alla trama.
+Quindi, eliminiamo le colonne di poco interesse ed effettuiamo un'operazione di "merge" tra i due datasets.
+
+```{r DC 1, echo=TRUE}
+Anime=Anime[,-c(2,7,8,9,10,11,14:34)]
+```
+```{r DC 2, echo=TRUE}
+Anime=Anime[,c(1,4,3,2,5,6,7)]  #Contiene la maggior parte dei dettagli
+```
+```{r DC 3, echo=TRUE} 
+Anime_syn=Anime_syn[,-c(2:4)]  #Contiente solo il riassunto associabile tramite id
+```
+```{r DC 4, echo=TRUE} 
+Anime=merge(Anime,Anime_syn,by="MAL_ID")
+```
+```{r DC 5, echo=TRUE} 
+colnames(Anime)[1]="ID"
+colnames(Anime)[2]="Name"
+```
+```{r DC 5.5, echo=TRUE} 
+rm(Anime_syn)
+```
+
+Il risultato finale sarà il seguente:
+
+```{r DC 6, echo=FALSE}
+kable(head(Anime,3), align = "c")
+```
+Si notino i riassunti di alcuni items; in diversi di questi sunti, sono presenti parole incomplete (soprattuto all'inizio).
+Risolviamo il problema, tramite uno script in **python**, effettuando lo scraping della pagina html di ogni singolo anime ed eliminiamo quelli che non hanno un riassunto.
+
+```{python myScript, eval=F, echo=T}
+import csv
+import pandas as pd
+import numpy as np
+import os
+import zipfile as ZipFile
+import json
+from bs4 import BeautifulSoup
+import string
+import os
+from bs4 import BeautifulSoup
+import requests egeegeg
+import time
+from datetime import datetime
+import json
+from zipfile import ZipFile
+import pandas as pd
+import shutil
+import zipfile
+import random
+
+anime_syn = pd.read_csv("anime_merged.csv", header = 0)
+
+#Funzioni######################################
+
+def get_description(sum_info):
+    return sum_info.findAll("p", {"itemprop": "description"})[0].text
+
+def extract_zip(input_zip):
+    input_zip = ZipFile(input_zip)
+    return {name: input_zip.read(name) for name in input_zip.namelist()}
+
+def get_info_anime(anime_id):
+    data = extract_zip(f"AnimeZip2/{anime_id}.zip")
+    anime_info = data["details.html"].decode()
+    
+    soup = BeautifulSoup(anime_info, "html.parser")
+    description = get_description(soup)
+    description=description.replace('\n','')
+    description=" ".join(description.split())
+    description=description.replace('\n','')
+
+    return description
+    
+##############################################
+anime = anime_syn.drop(anime_syn[anime_syn.sypnopsis == 'No synopsis information has been added to this title. Help improve our database by adding a synopsis here .'].index)
+anime.dropna(subset=["sypnopsis"], inplace=True)
+
+anime['sypnopsis']=anime.apply(lambda x : get_info_anime(x['ID']),axis=1 )
+
+```
+
+In questo modo i riassunti saranno modificati correttamente e il datasets degli anime conterrà **15497** items.
+
+```{r DC 7, echo=FALSE}
+Anime=fread("Anime_corrected.csv")
+Anime=Anime[,-1]
+
+kable(head(Anime,3), align = "c")
+```
+C'è un ulteriore problema: all'interno del datasets appena corretto ci sono deli items che non sono giunti in occidente e che hanno pocchissime informazioni (Infatti non si conosce nemmeno il loro titolo). Conviene eleminarli.
+
+```{r DC 7.5, echo=FALSE}
+Anime=Anime[!Anime$Name == "Unknown",]
+```
+
+Verifichiamo la presenza di duplicati ed eliminiamoli.
+
+```{r DC 7.52, echo=FALSE}
+sum(duplicated(Anime[,2]))
+Anime=Anime[!duplicated(Anime[,2]), ]
+```
+
+Il datasets "finale" degli anime conterrà **6307** items.
+
+Adesso, proviamo a studiare nel dettaglio il dataset dei **rating**.
+
+```{r DC 8, echo=FALSE}
+kable(head(Rating,5), align = "c")
+```
+Proviamo a verificare la presenza di **records duplicati**.
+
+```{r DC 9, echo=TRUE}
+sum(duplicated(Rating[,1:2]))
+```
+
+Fortunatamente non sono presenti utenti che hanno espresso più di una valutazione sullo stesso item.
+
+A questo punto il **problema** è che nel dataset dei rating potrebbero esserci items non presenti nel datasets degli anime; dunque occorre rimodellare la tabella dei rating in maniera tale da rendere "***compatibili***" i 2 set di dati.
+
+Per risolvere il problema, ci basta prendere in considerazione solo i rating di anime presenti in entrambi i datasets.
+
+```{r DC 10, echo=TRUE}
+colnames(Rating)[2]="ID"
+```
+```{r DC 11, echo=TRUE}
+Rating=merge(Rating,Anime[,1],by="ID")
+```
+```{r DC 12, echo=TRUE}
+Rating=Rating[,c(2,1,3)]
+```
+```{r DC 13, echo=TRUE}
+nrow(Rating)
+```
+
+Come possiamo vedere, dopo questi processi di pulizia, sono state eliminate **12.021.968** valutazioni.
+
+### **4 Analisi dei dati**
+
+*Per l'anailisi dei dati assumiamo che se un item ha avuto un certo numero di valutazioni X, allora il numero di visualizzazioni sarà maggiore uguale a X (tenendo in considerazione il fatto che molti utenti che hanno visto un prodotto non hanno espresso una valutazione); di conseguenza se un item è visto maggiormente, probabilmente, avrà anche buone valutazioni.*
+
+I 100 items più valutati dagli utenti sono: ***(Sono mostrati solo i primi 10 per numero di valutazioni)***
+
+```{r AD 1, echo=TRUE}
+top_n<-Rating %>% count(Rating$ID)
+top_n<-top_n %>% arrange(desc(n))
+top_n<-head(top_n,100)
+colnames(top_n)[1]="ID"
+colnames(top_n)[2]="Valutazioni"
+top_n=merge(top_n,Anime,by="ID")
+top_n=top_n[order( top_n[,2],decreasing = TRUE) ,]
+
+kable(head(top_n[,3:2],10))
+```
+```{r AD 2, echo=FALSE}
+ggplot(data=head(top_n,10), aes(x=Name, y=Valutazioni)) +
+  geom_bar(stat="identity", fill="maroon4")+ coord_flip()
+```
+Osserviamo la **media** delle valutazioni fornite dagli utenti.
+
+```{r AD 3, echo=FALSE}
+round(mean(as.numeric(top_n$Score)))
+```
+La media arrotondata delle valutazioni è **8**; quindi, in generale se un item ha molte valutazioni (dunque, se è maggiormente visto) generalmente tende ad avere una valutazione positiva.
+
+Vediamo quale sono le tipologie di opere da cui sono ispirati gli anime.
+```{r AD 4, echo=TRUE}
+slices <- c(sum(Anime$Source=="Manga"), sum(Anime$Source=="Original"), sum(Anime$Source=="Light novel"), sum(Anime$Source=="Visual novel"), sum(Anime$Source=="4-koma manga"),sum(Anime$Source=="Novel"),sum(Anime$Source=="Other")
+,sum(Anime$Source=="Unknown"),sum(Anime$Source=="Game"),sum(Anime$Source=="Picture book"),sum(Anime$Source=="Web manga"),sum(Anime$Source=="Digital manga"),sum(Anime$Source=="Music"),sum(Anime$Source=="Radio"),sum(Anime$Source=="Card game"),sum(Anime$Source=="Book"))
+
+
+lbls <- c("Manga", "Original", "Light novel", "Visual novel", "4-koma manga","Novel","Other","Unknown","Game","Picture book","Web manga","Digital manga","Music","Radio","Card game","Book")
+
+pie3D(slices,labels=lbls,explode=0.03,main="Source",radius = 1,height = 0.2,labelcex = 0.75,)
+```
+
+**Notiamo che** la maggior parte degli anime sono opere prime e originali oppure ispirate a manga.
+Inoltre, c'è una grossa fetta di grafico, ovvero "Unknown", che rappresenta tutti gli anime di cui si sa poco riguardo l'opera originaria.
+
+
+Diamo un'occhiata agli **studi di produzione**
+```{r AD 5, echo=FALSE, warning=FALSE}
+Studios=Anime %>% group_by(Studios) %>% summarise(Production = n())
+Studios=Studios[order( Studios[,2],decreasing = TRUE) ,]
+kable(head(Studios,15))
+```
+Sfortunatamente per molti items non conosciamo lo studio di produzione e consideriamo, dunque, Toei Animation lo studio più "produttivo" 
+
+```{r clean1, eval=FALSE, warning=FALSE, include=FALSE}
+rm(top_n)
+rm(Studios)
+rm(lbls)
+rm(slices)
+gc()
+```
+
+### **5 Confronto tra gli algoritmi di raccomandazione tradizionali**
+
+Si vuole creare un **sistema di raccomandazione** collaborative filtering confrontando gli algoritmi tradionali offerti dalla libreria "recommenderlab" e scegliendo quello con le prestazioni migliori sul dataset in esame.
+In particolare saranno presi in considerazione i seguenti algoritmi:
+
+- UBCF
+- SVD
+- POPULAR
+- RANDOM
+
+Il dataset in esame contiente una grande quantità di dati ma molti di questi non hanno una reale rilevanza statistica; di conseguenza, è utile e necessario, per ridurre i tempi di addestramento e predizione, effettuare una serie di operazioni per ridurre le dimensioni del dataset.
+
+Consideriamo il dataset dei rating
+
+```{r  warning=FALSE, echo=FALSE}
+kable(head(Rating))
+```
+
+Per utilizzare la libreria "***recommenderlab***" è necessario convertire la matrice in un oggetto del tipo "realRatingMatrix".
+
+```{r  , echo=FALSE}
+r<-as(Rating,"realRatingMatrix")
+rm(Rating)
+head(getRatingMatrix(r[,1:30]),10)
+```
+
+Prendiamo in considerazione solo gli utenti che hanno espresso almeno **15** pareri e gli items che hanno ricevuto almeno **250** valutazioni..
+
+
+```{r echo=FALSE, warning=FALSE,  echo=TRUE}
+sampled<-r[rowCounts(r)>15,colCounts(r)>250] #capire che fa
+```
+
+Riduciamo ulteriormente la dimensione del datasetdei rating, estraendo una percentuale (pari al **1%**) di records casuali.
+
+```{r RC4, include=FALSE}
+set.seed(1)
+smp_size_SMALL <- floor(0.01 * nrow(sampled))
+index1 <- sample(seq_len(nrow(sampled)), size = smp_size_SMALL)
+sample1 <- sampled[index1,]
+delay <- sampled[-index1,]
+rm(sampled)
+rm(index1)
+rm(smp_size_SMALL)
+gc()
+rm(r)
+```
+
+Adesso, il dataset contiene le valutazioni di **2680** utenti su **4066** items.
+
+Per il confronto tra i vari algoritmi è particolarmente utile creare uno **"schema di valutazione"**.
+
+Proviamo ad eseguire diversi algoritmi sul nostro dataset più volte, modificando i parametri degli schemi.
+
+```{r , echo=FALSE, include=FALSE }
+algorithms <- list("UBCF_15" = list(name = "UBCF", param = list(nn = 15,method="cosine")),                   
+                   "SVD approximation" = list(name="SVD", param=list(k = 15)),
+                   "random items" = list(name="RANDOM", param=NULL),
+                   "popular items" = list(name="POPULAR", param=NULL))                  
+```  
+
+
+- method = validation con k=10
+- train = 85% 
+- GoodRating= 4
+- Items conosciuti per utente = 3
+
+```{r echo=FALSE}
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.85,given=3,goodRating=4,k=10)
+res <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```  
+```{r echo=FALSE}
+plot(res, "ROC")
+#avg(res)
+```
+
+- method = validation con k=10
+- train = 85% 
+- GoodRating= 4
+- Items conosciuti per utente = 5
+
+```{r echo=FALSE,}
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.85,given=5,goodRating=4,k=10)
+res2 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```
+```{r echo=FALSE, , echo=FALSE}
+plot(res2, "ROC")
+#avg(res)
+```
+
+- method = validation con k=10
+- train = 85% 
+- GoodRating= 4
+- Items conosciuti per utente = 7
+
+```{r echo=FALSE, , echo=FALSE}
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.85,given=7,goodRating=4,k=10)
+res3 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```
+```{r echo=FALSE, , echo=FALSE}
+plot(res3, "ROC")
+#avg(res)
+```
+
+- method = validation con k=10
+- train = 85% 
+- GoodRating= 4
+- Items conosciuti per utente = 10
+
+```{r echo=FALSE, , echo=FALSE}
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.85,given=10,goodRating=4,k=10)
+res4 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```
+```{r echo=FALSE, , echo=FALSE}
+plot(res4, "ROC")
+#avg(res)
+```
+
+- method = validation con k=10
+- train = 75% 
+- GoodRating= 4
+- Items conosciuti per utente = 10
+
+```{r echo=FALSE, , echo=FALSE}
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.75,given=10,goodRating=4,k=10)
+res5 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))#rende popular migliore
+```
+```{r echo=FALSE, , echo=FALSE}
+plot(res5, "ROC")
+```
+
+- method = validation con k=10
+- train = 90% 
+- GoodRating= 4
+- Items conosciuti per utente = 10
+
+```{r echo=FALSE, , echo=FALSE}
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.90,given=10,goodRating=4,k=10)
+res6 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```
+
+```{r echo=FALSE, , echo=FALSE}
+plot(res6, "ROC")
+```
+
+- method = validation con k=10
+- train = 85% 
+- GoodRating= 7
+- Items conosciuti per utente = 10
+
+```{r echo=FALSE, , echo=FALSE}
+##Aumentiamo il goodrating
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.85,given=10,goodRating=7,k=10)
+res7 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```
+
+```{r echo=FALSE, , echo=FALSE}
+plot(res7, "ROC")
+```
+
+- method = validation con k=10
+- train = 85% 
+- GoodRating= 10
+- Items conosciuti per utente = 12
+
+```{r echo=FALSE, , echo=FALSE}
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.85,given=12,goodRating=10,k=10)
+res8 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```
+
+```{r echo=FALSE, , echo=FALSE}
+plot(res8, "ROC")
+```
+
+- method = validation con k=10
+- train = 85% 
+- GoodRating= 10
+- Items conosciuti per utente = 15
+
+```{r echo=FALSE, , echo=FALSE}
+scheme<-evaluationScheme(sample1,method="cross-validation",train=.85,given=15,goodRating=10,k=10)
+res9 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```
+```{r echo=FALSE, , echo=FALSE}
+plot(res9, "ROC")
+```
+
+- method = validation con k=10
+- train = 85% 
+- GoodRating= 2
+- Items conosciuti per utente = 15
+
+```{r echo=FALSE, , echo=FALSE}
+scheme<-evaluationScheme(sample1,method="split",train=.85,given=15,goodRating=2,k=10)
+res10 <- evaluate(scheme, algorithms, type = "topNList",n=c(1:20))
+```
+
+```{r echo=FALSE, , echo=FALSE}
+plot(res10, "ROC")
+```
+
+Per quanto riguarda i **tempi di esecuzione** (training e predizione) restano pressochè uguali per ogni esecuzione. In genere, **UBCF**, oltre a fornire risultati peggiori (insieme **RANDOM**), ha i tempi più lunghi
+
+Indipendentemente dalla percentuale di dati utilizzati per il training, **POPULAR** e **SVD** si comportano mediamente bene (mantenendo la qualità dei risultati comunque "bassa") ma **POPULAR** tende ad essere generalmente migliore rispetto a **SVD** (anche se, con l'aumentare del numero di items per utenti, si avvicina sempre di più a **POPULAR**)
+
+Notiamo, inolre, che aumentando il parametro "***GoodRating***", la distanza tra **SVD** e **POPULAR** aumenta. (Fornendo risultati leggermente migliori)
+
+Dato che **SVD** e **POPULAR** sono i due migliori algoritmi, proviamo a testare una versione "**ibrida**", cercando di ottenere risultati migliori.
+
+```{r echo=FALSE, , echo=FALSE}
+Algo2 <- list(
+    POPULAR = list(name = "POPULAR", param = NULL), 
+    SVD = list(name = "SVD", param=list(k = 15))
+)
+scheme<-evaluationScheme(sample1,method="cross-validation",given=15,goodRating=6,k=10)
+hybr <- evaluate(scheme, method = 'HYBRID', n =c(1:20),
+                      parameter = list(recommenders = Algo2))
+```
+
+```{r echo=FALSE, , echo=FALSE}
+plot(hybr)
+```
+Sfortunatamente, notiamo che unire i due algoritmi **peggiora** il risultato anzichè migliorarlo.
+
+### **6 Implementazione pratica dell'algoritmo**
+
+A questo punto, proviamo a implementare l'algoritmo migliore (trovato precedentemente) e a filtrare i risultati utilizzando strategie ***content-based***.
+
+Inanzitutto, implementiamo **SVD** (a causa della sua velocità) consigliando i top **20 item** (che saranno filtrati attraverso metodi content-based). (Saranno visualizzati gli ID degli anime suggeriti).
+
+Per effettuare i test utilizzeremo dei dati che il sistema non ha mai visto e che non sono mai stati utilizzati. (Temporaneamente saranno visualizzati solo gli ID)
+
+```{r echo=TRUE, , echo=FALSE}
+params <- list(normalize = "center",k=35)
+#model <- Recommender(sample1, method = "SVD",parameter=params)
+model <- Recommender(sample1, method = "SVD")
+#utilizziamo un test-set contenente dati mai utilizzati
+predizioni <- predict(model,delay[1:10,], n=20, type="topNList")
+```
+```{r echo=FALSE, , echo=FALSE}
+as(predizioni,"list")
+```
+
+Mettiamo da parte in due datasets differenti, i suggerimenti e i loro rispettivi rating previsti da POPULAR e salviamo, inoltre, gli id degli utenti su cui sono state effettuate le previsioni.
+
+```{r echo=TRUE, , echo=FALSE}
+filter=as(predizioni,"list")
+
+filter<-as.data.frame(do.call(cbind, filter),header=TRUE) #contiente i top n item
+filter_rating=as.data.frame(do.call(cbind, predizioni@ratings),header=TRUE) #contiente i rating top n item
+
+User=c()
+
+for (i in 1:ncol(filter)) {
+ User[i]<-colnames(filter[i])
+}
+#colnames(filter) in alternativa
+
+rm(model)
+rm(i)
+#rm(predizioni)
+gc()
+```
+
+Consideriamo tutti i rating forniti dagli utenti su cui sono state effettuate le predizioni.
+
+```{r echo=TRUE, , echo=FALSE}
+##come se ripristinassimo le informazioni relative agli utenti
+mat<-as(delay,"data.frame")
+User=as.data.frame(User)
+colnames(User)[1] <- "Users"
+colnames(mat)[1] <- "Users"
+mat_merge=merge(User,mat,by="Users")
+colnames(mat_merge)[2] <- "ID"
+rm(mat)
+gc()
+```
+
+Associamo ad ogni valutazione le caratteristiche dell'anime corrispondende.
+
+```{r echo=TRUE, , echo=FALSE}
+Rating=merge(mat_merge,Anime,by="ID")
+```
+```{r echo=FALSE, , echo=FALSE}
+kable(head(Rating[,1:5],3), align = "c")
+```
+
+Procediamo con la creazione degli **items-profiles**.
+
+```{r eval=FALSE, , echo=TRUE, include=FALSE}
+
+Anime=read.csv("anime.csv")
+
+Anime=Anime[,-c(3,5,6:35)]
+
+generi<-Anime
+generi = as.data.frame(tstrsplit(generi[,3], ', ', type.convert=TRUE), stringsAsFactors=FALSE)
+colnames(generi)=c(1:13)
+
+All_generi=c("Action", 
+             "Adventure", 
+             "Comedy",
+             "Drama", 
+             "Ecchi", 
+             "Game",
+             "Harem",
+             "Music",
+             "Fantasy",
+             "Mystery", 
+             "Psychological", 
+             "Romance", 
+             "Slice of Life",
+             "Thriller",
+             "Demons", 
+             "Horror", 
+             "Military",
+             "Police",
+             "Sci-Fi",
+             "Sports",
+             "Supernatural",
+             "Dementia",
+             "Historical",
+             "Magic",
+             "Parody",
+             "School",
+             "Shounen",
+             "Super Power",
+             "Mecha",
+             "Seinen",
+             "Shoujo",
+             "Vampire",
+             "Martial Arts",
+             "Samurai",
+             "Space",
+             )
+
+generiMatrix=matrix(0,nrow=17563,ncol=37)
+generiMatrix[1,]=All_generi
+
+colnames(generiMatrix)=All_generi
+
+for (i in 1:nrow(generi)) {
+ for (col in 1:ncol(generi)) {
+  gen_col = which(generiMatrix[1,] == generi[i,col]) 
+  generiMatrix[i+1,gen_col] = 1
+ }
+}
+
+generiMatrix<-generiMatrix[-1,]
+Generi=as.data.frame(generiMatrix,stringsAsFactors = F)
+
+for(col in 1:ncol(Generi)){
+ Generi[,col]=as.integer(Generi[,col])
+}
+
+top100_Item_profiles<-cbind(Anime[,1],generiMatrix)
+
+df<-as.data.frame(top100_Item_profiles)
+
+write.csv(df, 'IP_COMPLETE2.csv')
+
+```
+
+```{r echo=FALSE, , echo=TRUE}
+Item_profile=read.csv("IP_COMPLETE2.csv")
+Item_profile=Item_profile[,-1]
+colnames(Item_profile)[1]="ID"
+head(Item_profile)
+```
+
+Creiamo gli **users-profiles**
+
+```{r echo=TRUE, , echo=TRUE}
+All_generi=c("User","Action","Adventure","Comedy","Drama", "Ecchi", "Game","Harem","Music","Fantasy","Mystery", "Psychological", "Romance", "Slice of Life","Thriller","Demons","Horror",  "Military",
+             "Police","Sci-Fi","Sports","Supernatural","Dementia","Historical","Magic","Parody","School","Shounen","Super Power","Mecha","Seinen","Shoujo","Vampire",
+             "Martial Arts","Samurai","Space")
+User_Profile=matrix(0,nrow=nrow(User),ncol=36)
+colnames(User_Profile)=All_generi
+User_Profile[,1]=User[,1]
+
+
+for(i in 1:nrow(User_Profile)){
+ current=mat_merge[mat_merge$Users == User_Profile[i,1],]  ## avrò i rating del'utente corrente
+ #scorre user profile
+ gener_profile=merge(current,Item_profile,by="ID")
+ g <- 2
+ for(col in 4:ncol(gener_profile)){
+  sum <- 0
+  n <- 0
+  rating <- 0
+  for(row in 1:nrow(gener_profile) ){
+   if(gener_profile[row,col]==1){
+    sum=sum+gener_profile[row,3]
+    n <- n+1
+   }
+  }
+  if(n!=0){
+   rating <- sum/n
+   User_Profile[i,g] <- round(rating)
+  } 
+  g <- g+1
+ }
+}
+```
+
+Ricalcolo i rating degli items suggeriti da **SVD** utilizzando un approccio content-based e facendo la media tra vecchio rating+nuovo.
+
+```{r echo=TRUE, , echo=TRUE}
+utenti=colnames(filter)
+
+for(i in 1:nrow(User_Profile)){
+ id=User_Profile[i,1]
+ current_top=filter[colnames(filter)==id] #seleziono gli item associati al profilo corrente
+ 
+ current_top=as.data.frame(current_top)
+ colnames(current_top)="ID"
+ current_top=merge(current_top,Item_profile,by="ID") ##preno gli item profile di quelli dell'utente
+ 
+ user=as.vector(User_Profile[i,2:35],mode='numeric')
+ 
+ for(items in 1:nrow(current_top)){
+  item=as.vector(current_top[items,2:35],mode='numeric')
+  distanza=(cosine(user,item ))*10
+  filter_rating[items,i]=(((filter_rating[items,i]*1)+distanza[1,1]*2)/3)#faccio la media dei rating predetti tra svd e content based
+  }#scorro gli item
+
+ rm(current_top)
+}
+
+```
+
+Selezioniamo i primi 10 per ogni utente per rating maggiore
+
+```{r echo=TRUE, , echo=TRUE}
+for(i in 1:ncol(filter_rating)){
+ items_id=as.list(filter[,i])
+ items_rating=as.list(filter_rating[,i])
+
+ df <- do.call(rbind, Map(data.frame, A=items_id, B=items_rating))
+ colnames(df)[1]="ID"
+ colnames(df)[2]="rating"
+ df=df[order( df[,2],decreasing = TRUE ),]
+ final_for_user=head(df,10)
+ #final_for_user=final_for_user[order( final_for_user[,2],decreasing = TRUE ),]
+ final_for_user=merge(final_for_user,Anime,by="ID")
+ final_for_user=final_for_user[order(final_for_user[,2],decreasing = TRUE) ,]
+ #rownames(final_for_user)=c(1:10)
+ print(final_for_user[,c(3,4,2)])
+}
+#Notiamo che items posizionati in fondo alla lista si ritrovano al primo posto
+```
+
+
